@@ -9,6 +9,11 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+// SSH keepalive 间隔（秒）。连接空闲时周期性发送保活消息，
+// 防止空闲连接被服务器（ClientAliveInterval）或中间 NAT/防火墙回收。
+const KEEPALIVE_INTERVAL: u32 = 30;
 
 pub fn create_session(
     config: &Config,
@@ -82,11 +87,22 @@ pub fn create_session(
             .context("Authentication failed. Please check your username/password.")?;
     }
 
+    // 启用 SSH 应用层 keepalive，空闲时周期性发送保活消息
+    sess.set_keepalive(true, KEEPALIVE_INTERVAL);
+
     println!("Successfully connected!");
     Ok(sess)
 }
 
 pub fn handle_interactive_shell(sess: Session) -> Result<()> {
+    terminal::enable_raw_mode()?;
+    let result = run_interactive_shell(sess);
+    // 无论成功或失败，都必须恢复终端模式，避免终端卡死在 raw mode
+    terminal::disable_raw_mode()?;
+    result
+}
+
+fn run_interactive_shell(sess: Session) -> Result<()> {
     let mut channel = sess.channel_session()?;
     let (width, height) = terminal::size()?;
     channel.request_pty(
@@ -96,13 +112,28 @@ pub fn handle_interactive_shell(sess: Session) -> Result<()> {
     )?;
     channel.shell()?;
 
-    terminal::enable_raw_mode()?;
     sess.set_blocking(false);
 
     let mut stdout = io::stdout();
     let mut channel_buf = [0; 1024];
 
+    // keepalive 调度：记录距离下次发送保活消息的剩余时间
+    let mut next_keepalive = Instant::now();
+
     'main_loop: loop {
+        // 周期性发送 SSH keepalive 消息，防止空闲连接被服务器或中间设备断开
+        if next_keepalive <= Instant::now() {
+            match sess.keepalive_send() {
+                Ok(secs) => {
+                    next_keepalive = Instant::now() + Duration::from_secs(secs as u64)
+                }
+                Err(_) => {
+                    // 发送失败（如网络暂时不可用），稍后重试；
+                    // 真正的连接断开会由下方 channel 读取以 EOF 形式发现
+                    next_keepalive = Instant::now() + Duration::from_secs(5);
+                }
+            }
+        }
         if crossterm::event::poll(std::time::Duration::from_millis(10))? {
             if let Ok(event) = crossterm::event::read() {
                 match event {
@@ -169,7 +200,6 @@ pub fn handle_interactive_shell(sess: Session) -> Result<()> {
         }
     }
 
-    terminal::disable_raw_mode()?;
     Ok(())
 }
 
